@@ -1,3 +1,3 @@
-CFLAGS=-std=gnu99 -Wall -Werror
+CFLAGS=-Wall -Werror -Os -s
 i2cio: i2cio.c
-clean:; rm -f i2cio
+clean:; git clean -f

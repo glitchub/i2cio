@@ -16,82 +16,102 @@
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
 
-#define MAXMSGS 32 // max messages per transaction
-#define MAXLEN 256 // max message length
+#define MAXMSGS I2C_RDWR_IOCTL_MAX_MSGS // max messages per transaction
+#define MAXLEN 256                      // max message length
 
 #define die(...) fprintf(stderr,__VA_ARGS__), exit(1)
 
 #define usage() die("Usage:\n\
 \n\
-    i2cio [-d] < command > read_data\n\
+    i2cio [options] < commands > read_data\n\
 \n\
-Perform I2C transactions specified by the command string. Note in this context\n\
-an I2C transaction is two or more messages for the same device, separated by\n\
-RESTART and transmitted atomically.\n\
+Perform I2C transactions specified by commands read from stdin. Note in this\n\
+context an I2C transaction is two or more messages for the same device,\n\
+separated by RESTART and performed atomically.\n\
 \n\
 The command text consists of single-character commands followed by some number\n\
 of numeric fields.\n\
 \n\
-    D addr bus        - specify I2C address and bus number for all subsequent R and W operations.\n\
+    D addr bus        - specify I2C address and bus number for all subsequent R\n\
+                        and W operations.\n\
     R length          - where length is 1-128, read specified number of bytes.\n\
-    W byte [... byte] - where N's are numeric values 0-255, write specified bytes.\n\
-    ;                 - end the current transaction, next R or W starts a new one.\n\
+    W byte [... byte] - where N's are numeric values 0-255, write specified\n\
+                        bytes.\n\
+    ;                 - end the current transaction, next R or W starts a new\n\
+                        one.\n\
     # ...             - ignore text to end of line (aka a comment)\n\
 \n\
-Up to 32 R/W messages can be supported in a single transaction. \n\
+Character case is not significant. Numeric values can be specified in\n\
+decimal, hex, or octal (per strtoul()), followed by at least one whitespace\n\
+character. Other whitespace is ignored.\n\
 \n\
-Transactions are atomic, therefore not actually performed until ';' (or 'D' or\n\
-EOF, if encountered after R or W).\n\
+Example, to send command 0x06 to device 0x30 on bus 1, and read the two-byte\n\
+result (i.e. to read the temperature from a DDR SPD):\n\
 \n\
-Each R command will produce its own line of output.\n\
+    echo D 0x30 1 W 0x06 R 2 | i2cio\n\
 \n\
-Character case and line breaks are insignificant.\n\
+By default, each R command will produce one line of space-separated hex\n\
+values. Use the -d option to output decimal or -b option to output raw\n\
+binary instead.\n\
 \n\
-Numbers can be specified as hex, decimal, or octal (per strtoul).\n\
+Up to %d R/W messages can be supported in a single transaction.\n\
 \n\
--d option enables dry run, bus device will not actually be opened.\n\
-")
+Transactions are atomic, therefore not actually performed until ';', 'D' or\n\
+EOF is encountered.\n\
+\n\
+If the -n option is given, then a dry run is performed. The specified I2C\n\
+device will not be opened and read command results will report as 0x55's.\n\
+", MAXMSGS)
 
-// malloc or die
-void *alloc(int n)
-{
-    void *p=malloc(n);
-    if (!p) die("malloc failed: %s\n", strerror(errno));
-    return p;
-}
+bool dryrun = false, decimal = false, binary = false;
 
-bool dryrun = 0;
-
-// Perform I2C transaction ond print received data (or die)
+// Perform an I2C transaction and output received data
 void transact(struct i2c_msg *msgs, int nmsgs, int i2cfd)
 {
     struct i2c_rdwr_ioctl_data transaction = { .msgs=msgs, .nmsgs=nmsgs };
-    if (!dryrun && ioctl(i2cfd, I2C_RDWR, &transaction)) die ("I2C_RDWR ioctl failed: %s\n", strerror(errno));
+    if (!dryrun && ioctl(i2cfd, I2C_RDWR, &transaction) < 0) die ("I2C_RDWR ioctl failed: %s\n", strerror(errno));
     for (int n=0; n < nmsgs; n++)
     {
         if (msgs[n].flags & I2C_M_RD)
         {
-            for (int i=0; i < msgs[n].len; i++) printf("0x%02X ",msgs[n].buf[i]);
-            printf("\n");
+            if (dryrun) memset(msgs[n].buf, 0x55, msgs[n].len); // fake it if dryrun
+            if (binary)
+                // write raw data
+                write(1, msgs[n].buf, msgs[n].len);
+            else
+            {
+                // write formatted data
+                for (int i=0; i < msgs[n].len; i++) printf(decimal ? "%d " : "0x%.02X ", msgs[n].buf[i]);
+                printf("\n");
+            }
         }
     }
 }
 
-int main(int argc, char *argv[])
+int main(int argc, char **argv)
 {
-    if (argc > 1) 
+    while (*++argv)
     {
-        if (strcmp(argv[1], "-d")) usage();
-        dryrun=true;
-    }   
-    
-    uint16_t addr;                      // current I2C device address
+        char *o = *argv;
+        if (*o != '-') usage();
+        while (*++o) switch(*o)
+        {
+            case 'b': binary = true; break;
+            case 'd': decimal = true; break;
+            case 'n': dryrun = true; break;
+            default: usage();
+        }
+    }
+
+    uint16_t addr = 0;                  // current I2C device address
     int i2cfd = -1;                     // current I2C bus file descriptor (/dev/i2c-X)
 
     struct i2c_msg msgs[MAXMSGS];       // The largest possible transaction
-    for (int n=0; n < MAXMSGS; n++)     // Each one gets a buffer 
-        msgs[n].buf=alloc(MAXLEN);
-    
+
+    for (int n=0; n < MAXMSGS; n++)     // Each gets a buffer
+        if (!(msgs[n].buf=malloc(MAXLEN)))
+            die("malloc failed: %s\n", strerror(errno));
+
     int nmsgs=0;                        // Number of messages in current transaction
 
     // parse state
@@ -109,11 +129,11 @@ int main(int argc, char *argv[])
     while (1)
     {
         char *line=NULL; size_t size=0;
-        if (getline(&line, &size, stdin) < 0) 
+        if (getline(&line, &size, stdin) < 0)
         {
             if (errno) die("Input error in line %d: %s\n", lines, strerror(errno));
             break;
-        }    
+        }
 
         int ofs=0;
         while (1)
@@ -139,11 +159,11 @@ int main(int argc, char *argv[])
                             die("Unexpected '%c' at line %d offset %d\n", line[ofs], lines, ofs+1);
                     }
                     if (nmsgs >= MAXMSGS) die("Max %d messages per transaction\n",MAXMSGS);
-                    
+
                     // init next message
                     msgs[nmsgs].addr = addr;
                     msgs[nmsgs].flags = I2C_M_RD;
-                    
+
                     parser = READ;
                     ofs++;
                     break;
@@ -247,7 +267,7 @@ int main(int argc, char *argv[])
                                 sprintf((char *)&name, "/dev/i2c-%d", N);
                                 i2cfd = open(name, O_RDWR);
                                 if (i2cfd < 0) die("Invalid bus at line %d offset %d (%s: %s)\n", lines, ofs+1, name, strerror(errno));
-                            }    
+                            }
                             parser = IDLE;
                             break;
 
