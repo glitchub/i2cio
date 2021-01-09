@@ -1,18 +1,17 @@
+// This software is released as-is into the public domain, as described at
+// https://unlicense.org. Do whatever you like with it.
+//
+// See https://github.com/glitchub/i2cio for more information.
+
 #include <stdio.h>
-#include <stdint.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <errno.h>
-#include <getopt.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/ioctl.h>
 #include <ctype.h>
-
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
 
@@ -25,18 +24,19 @@
 \n\
     i2cio [options] < commands > read_data\n\
 \n\
-Perform I2C transactions specified by commands read from stdin. Note in this\n\
-context an I2C transaction is two or more messages for the same device,\n\
-separated by RESTART and performed atomically.\n\
+Perform I2C transactions specified by commands read from stdin.\n\
+\n\
+A transaction may consist of up to %d messasges for the same device, separated\n\
+by RESTART and performed atomically.\n\
 \n\
 The command text consists of single-character commands followed by some number\n\
 of numeric fields.\n\
 \n\
     D addr bus        - specify I2C address and bus number for all subsequent R\n\
                         and W operations.\n\
-    R length          - where length is 1-128, read specified number of bytes.\n\
+    R length          - where length is 1-256, read specified number of bytes.\n\
     W byte [... byte] - where N's are numeric values 0-255, write specified\n\
-                        bytes.\n\
+                        bytes. Up to 256 bytes may be specified.\n\
     ;                 - end the current transaction, next R or W starts a new\n\
                         one.\n\
     # ...             - ignore text to end of line (aka a comment)\n\
@@ -46,18 +46,13 @@ decimal, hex, or octal (per strtoul()), followed by at least one whitespace\n\
 character. Other whitespace is ignored.\n\
 \n\
 Example, to send command 0x06 to device 0x30 on bus 1, and read the two-byte\n\
-result (i.e. to read the temperature from a DDR SPD):\n\
+result (i.e. to get the temperature from a DDR SPD):\n\
 \n\
     echo D 0x30 1 W 0x06 R 2 | i2cio\n\
 \n\
 By default, each R command will produce one line of space-separated hex\n\
 values. Use the -d option to output decimal or -b option to output raw\n\
 binary instead.\n\
-\n\
-Up to %d R/W messages can be supported in a single transaction.\n\
-\n\
-Transactions are atomic, therefore not actually performed until ';', 'D' or\n\
-EOF is encountered.\n\
 \n\
 If the -n option is given, then a dry run is performed. The specified I2C\n\
 device will not be opened and read command results will report as 0x55's.\n\
@@ -68,9 +63,9 @@ bool dryrun = false, decimal = false, binary = false;
 // Perform an I2C transaction and output received data
 void transact(struct i2c_msg *msgs, int nmsgs, int i2cfd)
 {
-    struct i2c_rdwr_ioctl_data transaction = { .msgs=msgs, .nmsgs=nmsgs };
+    struct i2c_rdwr_ioctl_data transaction = { .msgs = msgs, .nmsgs = nmsgs };
     if (!dryrun && ioctl(i2cfd, I2C_RDWR, &transaction) < 0) die ("I2C_RDWR ioctl failed: %s\n", strerror(errno));
-    for (int n=0; n < nmsgs; n++)
+    for (int n = 0; n < nmsgs; n++)
     {
         if (msgs[n].flags & I2C_M_RD)
         {
@@ -81,7 +76,7 @@ void transact(struct i2c_msg *msgs, int nmsgs, int i2cfd)
             else
             {
                 // write formatted data
-                for (int i=0; i < msgs[n].len; i++) printf(decimal ? "%d " : "0x%.02X ", msgs[n].buf[i]);
+                for (int i = 0; i < msgs[n].len; i++) printf(decimal ? "%d " : "0x%.02X ", msgs[n].buf[i]);
                 printf("\n");
             }
         }
@@ -90,6 +85,7 @@ void transact(struct i2c_msg *msgs, int nmsgs, int i2cfd)
 
 int main(int argc, char **argv)
 {
+    // command line switches
     while (*++argv)
     {
         char *o = *argv;
@@ -103,39 +99,40 @@ int main(int argc, char **argv)
         }
     }
 
-    uint16_t addr = 0;                  // current I2C device address
+    unsigned int addr = 0;              // current I2C device address
     int i2cfd = -1;                     // current I2C bus file descriptor (/dev/i2c-X)
 
     struct i2c_msg msgs[MAXMSGS];       // The largest possible transaction
 
-    for (int n=0; n < MAXMSGS; n++)     // Each gets a buffer
-        if (!(msgs[n].buf=malloc(MAXLEN)))
+    for (int n = 0; n < MAXMSGS; n++)   // Each gets a buffer
+        if (!(msgs[n].buf = malloc(MAXLEN)))
             die("malloc failed: %s\n", strerror(errno));
 
-    int nmsgs=0;                        // Number of messages in current transaction
+    int nmsgs = 0;                      // Number of messages in current transaction
 
-    // parse state
-    enum { INIT,                        // expecting D
-           IDLE,                        // expecting D, R, W, ; or EOF
-           READ,                        // expecting read length
-           WRITE,                       // expecting byte to write
-           WRITING,                     // expecting byte, D, R, W, ; or EOF
-           ADDR,                        // expecting device address
-           BUS                          // expecting bus number
-           };
-    int parser=INIT;                    // Initially, expect 'D'
+    // parser state
+    enum
+    {
+        INIT,       // expecting D
+        IDLE,       // expecting D, R, W, ; or EOF
+        READ,       // expecting read length
+        WRITE,      // expecting byte to write
+        WRITING,    // expecting byte, D, R, W, ; or EOF
+        ADDR,       // expecting device address
+        BUS         // expecting bus number
+    } state = INIT;
 
-    int lines=1;
+    int lines = 1;
     while (1)
     {
-        char *line=NULL; size_t size=0;
+        char *line = NULL; size_t size = 0;
         if (getline(&line, &size, stdin) < 0)
         {
             if (errno) die("Input error in line %d: %s\n", lines, strerror(errno));
             break;
         }
 
-        int ofs=0;
+        int ofs = 0;
         while (1)
         {
             while (isspace(line[ofs])) ofs++;
@@ -145,7 +142,7 @@ int main(int argc, char **argv)
             {
                 case 'R':
                     // add read message to transaction
-                    switch(parser)
+                    switch (state)
                     {
                         case WRITING:
                             nmsgs++;
@@ -164,13 +161,13 @@ int main(int argc, char **argv)
                     msgs[nmsgs].addr = addr;
                     msgs[nmsgs].flags = I2C_M_RD;
 
-                    parser = READ;
+                    state = READ;
                     ofs++;
                     break;
 
                 case 'W':
                     // add write message to transaction
-                    switch(parser)
+                    switch (state)
                     {
                         case WRITING:
                             nmsgs++;
@@ -189,18 +186,18 @@ int main(int argc, char **argv)
                     msgs[nmsgs].flags = 0;
                     msgs[nmsgs].len = 0;
 
-                    parser = WRITE;
+                    state = WRITE;
                     ofs++;
                     break;
 
                 case ';':
                     // end current transaction and return idle
-                    switch(parser)
+                    switch (state)
                     {
                         case WRITING:
                             nmsgs++;
                             transact(msgs, nmsgs, i2cfd);
-                            nmsgs=0;
+                            nmsgs = 0;
                             break;
 
                         case INIT:
@@ -210,7 +207,7 @@ int main(int argc, char **argv)
                             if (nmsgs)
                             {
                                 transact(msgs, nmsgs, i2cfd);
-                                nmsgs=0;
+                                nmsgs = 0;
                             }
                             break; // sugar
 
@@ -218,18 +215,18 @@ int main(int argc, char **argv)
                             goto unexpected;
                     }
 
-                    parser=IDLE;
+                    state = IDLE;
                     ofs++;
                     break;
 
                 case 'D':
                     // set device address and bus
-                    switch(parser)
+                    switch (state)
                     {
                         case WRITING:
                             nmsgs++;
                             transact(msgs, nmsgs, i2cfd);
-                            nmsgs=0;
+                            nmsgs = 0;
                             break;
 
                         case INIT:
@@ -242,21 +239,21 @@ int main(int argc, char **argv)
                         default:
                             goto unexpected;
                     }
-                    parser = ADDR;
+                    state = ADDR;
                     ofs++;
                     break;
 
                 case '0' ... '9':
                 {
                     char *end;
-                    uint16_t N = strtoul(line+ofs, &end, 0);
+                    unsigned int N = strtoul(line+ofs, &end, 0);
 
-                    switch(parser)
+                    switch (state)
                     {
                         case ADDR:
                             if (N > 127) die("Device address exceeds 127 at line %d offset %d\n", lines, ofs+1);
-                            addr=N;
-                            parser = BUS;
+                            addr = N;
+                            state = BUS;
                             break;
 
                         case BUS:
@@ -268,14 +265,13 @@ int main(int argc, char **argv)
                                 i2cfd = open(name, O_RDWR);
                                 if (i2cfd < 0) die("Invalid bus at line %d offset %d (%s: %s)\n", lines, ofs+1, name, strerror(errno));
                             }
-                            parser = IDLE;
+                            state = IDLE;
                             break;
 
                          case READ:
-                            if (N == 0) die("Read length must be at least 1 at line %d offset %d\n", lines, ofs+1);
-                            if (N > MAXLEN) die("Read length exceeds %d at line %d offset %d\n", MAXLEN, lines, ofs+1);
-                            msgs[nmsgs++].len=N;
-                            parser = IDLE;
+                            if (N < 1 || N > MAXLEN) die("Read length must be 1 to %d at line %d offset %d\n", MAXLEN, lines, ofs+1);
+                            msgs[nmsgs++].len = N;
+                            state = IDLE;
                             break;
 
                          case WRITE:
@@ -283,13 +279,13 @@ int main(int argc, char **argv)
                             if (N > 255) die("Write value exceeds 255 at line %d offset %d\n", lines, ofs+1);
                             msgs[nmsgs].buf[msgs[nmsgs].len++] = N;
                             if (msgs[nmsgs].len > MAXLEN) die("Write length exceeds %d at line %d offset %d\n", MAXLEN, lines, ofs+1);
-                            parser = WRITING;
+                            state = WRITING;
                             break;
 
                          default:
                             goto unexpected;
                     }
-                    ofs=(int)(end-line);
+                    ofs = (int)(end-line);
                     break;
                 }
 
@@ -301,18 +297,18 @@ int main(int argc, char **argv)
         lines++;
     }
 
-    switch(parser)
+    switch (state)
     {
         case WRITING:
             nmsgs++;
             transact(msgs, nmsgs, i2cfd);
             break;
 
-         case IDLE:
+        case IDLE:
             if (nmsgs) transact(msgs, nmsgs, i2cfd);
             break;
 
-         default:
+        default:
             die("Unexpected end of input\n");
     }
 
