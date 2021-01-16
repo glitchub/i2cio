@@ -32,8 +32,8 @@ by RESTART and performed atomically.\n\
 The command text consists of single-character commands followed by some number\n\
 of numeric fields.\n\
 \n\
-    D addr bus        - specify I2C address and bus number for all subsequent R\n\
-                        and W operations.\n\
+    D addr bus        - specify the 7-bit I2C address and bus number for\n\
+                        subsequent R and W operations.\n\
     R length          - where length is 1-256, read specified number of bytes.\n\
     W byte [... byte] - where N's are numeric values 0-255, write specified\n\
                         bytes. Up to 256 bytes may be specified.\n\
@@ -45,10 +45,10 @@ Character case is not significant. Numeric values can be specified in\n\
 decimal, hex, or octal (per strtoul()), followed by at least one whitespace\n\
 character. Other whitespace is ignored.\n\
 \n\
-Example, to send command 0x06 to device 0x30 on bus 1, and read the two-byte\n\
-result (i.e. to get the temperature from a DDR SPD):\n\
+Example, to send command 0x06 to device 0x18 on bus 1 and read the two-byte\n\
+result (i.e. to get the temperature from DDR4 SPD):\n\
 \n\
-    echo D 0x30 1 W 0x06 R 2 | i2cio\n\
+    echo D 0x18 1 W 0x06 R 2 | i2cio\n\
 \n\
 By default, each R command will produce one line of space-separated hex\n\
 values. Use the -d option to output decimal or -b option to output raw\n\
